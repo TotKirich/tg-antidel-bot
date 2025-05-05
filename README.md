@@ -65,7 +65,7 @@
 
 2. Скопируйте проект в нужную директорию (рекомендуется `/var/opt`):
    ```bash
-   unzip ubot.zip
+   unzip tg-antidel-bot-main.zip
    cd ubot
    
 3. Прописываем данные согласно шаблону в файл config.json (заменяем данные на свои)
