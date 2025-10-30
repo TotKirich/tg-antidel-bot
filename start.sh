@@ -4,7 +4,7 @@
 echo "🔧 Проверка зависимостей ..."
 apt update >/dev/null 2>&1
 apt install -y python3 python3-pip >/dev/null 2>&1
-pip3 install -r requirements.txt >/dev/null 2>&1
+pip3 install -r requirements.txt --break-system-packages >/dev/null 2>&1
 
 # Проверка уже запущенных процессов
 if pgrep -f "userbot.py" > /dev/null || pgrep -f "notify_bot.py" > /dev/null; then
