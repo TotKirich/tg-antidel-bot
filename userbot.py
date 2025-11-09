@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS messages (
     message_id INTEGER,
     user_id INTEGER,
     username TEXT,
+    first_name TEXT,
+    last_name TEXT,
     text TEXT,
     file_path TEXT,
     date_sent TEXT,
@@ -102,7 +104,7 @@ def handle_message(client, message):
     media_path = save_media(message)
     cur.execute("""
         INSERT OR REPLACE INTO messages
-        (chat_id, message_id, user_id, username, text, file_path, date_sent)
+        (chat_id, message_id, user_id, username, first_name, last_name, text, file_path, date_sent)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         message.chat.id,
@@ -138,18 +140,18 @@ def handle_deleted(client, messages):
     else:
         msg_chat_id = first_msg.chat.id
 
-    cur.execute("SELECT user_id, username FROM messages WHERE chat_id=? AND message_id=?", (msg_chat_id, first_msg.id))
+    cur.execute("SELECT user_id, first_name, last_name username FROM messages WHERE chat_id=? AND message_id=?", (msg_chat_id, first_msg.id))
     user_row = cur.fetchone()
     if not user_row:
         write_log("[fail] не удалось определить пользователя для обработки")
         return
 
-    user_id, username = user_row
+    user_id, username, first_name, last_name = user_row
     username = username or f"user{user_id}"
 
     if len(messages) >= 10:
         if user_id not in chat_map:
-            title = f"❌Del {username}"
+            title = f"❌Del {first_name} {last_name} @{username}"
             try:
                 chat = client.create_group(title=title, users=["me"])
                 chat_map[user_id] = chat.id
@@ -173,7 +175,7 @@ def handle_deleted(client, messages):
 
         if text.strip() or not file_path:
             try:
-                log = f"❌ Сообщение удалено\n\n👤 Пользователь: @{username or user_id}\n💬 Текст:\n{text or 'Без текста'}"
+                log = f"❌ Сообщение удалено\n\n👤 Пользователь: {first_name} {last_name}\n @{username or user_id}\n💬 Текст:\n{text or 'Без текста'}"
                 client.send_message(target_chat, log)
                 write_log("[send] отправлен лог текстового сообщения")
             except Exception as e:
@@ -183,7 +185,7 @@ def handle_deleted(client, messages):
             try:
                 size = os.path.getsize(file_path)
                 write_log(f"[media] отправка файла: {file_path}, размер: {size} байт")
-                client.send_document(target_chat, file_path, caption=f"📎 Медиа удалённого сообщения от @{username or user_id}")
+                client.send_document(target_chat, file_path, caption=f"📎 Медиа удалённого сообщения от {first_name} {last_name} @{username or user_id}")
                 write_log("[media] файл отправлен")
             except Exception as e:
                 write_log(f"[error] send_document: {e}")
@@ -198,7 +200,7 @@ def handle_edit(client, message):
     cur.execute("SELECT text FROM messages WHERE chat_id=? AND message_id=?", (message.chat.id, message.id))
     old = cur.fetchone()
     if old and old[0] != (message.text or ""):
-        log = f"✏️ Сообщение изменено\n\n👤 Пользователь: @{message.from_user.username or message.from_user.id}\n🧾 Было:\n{old[0]}\n\n📄 Стало:\n{message.text}"
+        log = f"✏️ Сообщение изменено\n\n👤 Пользователь: {message.from_user.first_name} @{message.from_user.username or message.from_user.id}\n🧾 Было:\n{old[0]}\n\n📄 Стало:\n{message.text}"
         try:
             client.send_message(LOG_GROUP_ID, log)
             write_log("[ok] текст изменения отправлен")
