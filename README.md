@@ -129,4 +129,7 @@ bash start.sh
 ├── start.sh               # Быстрый запуск вручную
 ├── requirements.txt       # Зависимости
 └── messages.db            # База данных (создаётся автоматически)
+
+[empty]
 ```
+
