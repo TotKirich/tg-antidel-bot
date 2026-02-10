@@ -105,12 +105,14 @@ def handle_message(client, message):
     cur.execute("""
         INSERT OR REPLACE INTO messages
         (chat_id, message_id, user_id, username, first_name, last_name, text, file_path, date_sent)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         message.chat.id,
         message.id,
         message.from_user.id if message.from_user else None,
         message.from_user.username if message.from_user else None,
+        message.from_user.first_name if message.from_user else None,
+        message.from_user.last_name if message.from_user else None,
         message.text or "",
         media_path,
         datetime.now().isoformat()
@@ -140,7 +142,7 @@ def handle_deleted(client, messages):
     else:
         msg_chat_id = first_msg.chat.id
 
-    cur.execute("SELECT user_id, first_name, last_name username FROM messages WHERE chat_id=? AND message_id=?", (msg_chat_id, first_msg.id))
+    cur.execute("SELECT user_id, first_name, last_name, username FROM messages WHERE chat_id=? AND message_id=?", (msg_chat_id, first_msg.id))
     user_row = cur.fetchone()
     if not user_row:
         write_log("[fail] не удалось определить пользователя для обработки")
