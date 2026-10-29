@@ -1,0 +1,31 @@
+# Linux host networking binds authweb to the configured host address (loopback by default).
+x-common: &common
+  image: tg-antidel-bot:local
+  build:
+    context: .
+    target: runtime
+  init: true
+  user: "${TG_GUARD_UID:-1000}:${TG_GUARD_GID:-1000}"
+  restart: unless-stopped
+  network_mode: host
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  volumes:
+    - ${TG_GUARD_DATA_DIR:-./data}:/data
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  stop_grace_period: 45s
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  userbot:
+    <<: *common
+  notifybot:
+    <<: *common
+    command: [python, notify_bot.py]

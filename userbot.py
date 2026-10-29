@@ -1,224 +1,222 @@
-
+"""Telegram Delete Guard v2. Import-safe; service mode never prompts for login."""
+import argparse
+import asyncio
 import os
-import sqlite3
-import json
-from datetime import datetime, timedelta
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from apscheduler.schedulers.background import BackgroundScheduler
+import signal
+import sys
+import time
 
-with open('config.json', 'r') as f:
-    config = json.load(f)
+from telethon import TelegramClient, events
+from authweb import AuthServer, web_authorize
+from recovery import Reconciler
+from message_metadata import capture
+from runtime import ROOT, bind_owner, instance_lock, read_config, sd_notify, setup_logging
+from storage import Store
+from stories import StoryMonitor
+from transport import AUTH_ERRORS, Delivery, MediaQueue, Network, media_bytes
 
-API_ID = config['api_id']
-API_HASH = config['api_hash']
-SESSION_NAME = "userbot_session"
-LOG_GROUP_ID = "me"
-MEDIA_DIR = "media"
-LOG_FILE = os.path.join(os.path.dirname(__file__), "log_main.txt")
 
-os.makedirs(MEDIA_DIR, exist_ok=True)
+def record_message(message, sender):
+    return capture(message, sender)
 
-def write_log(msg):
-    timestamped = f"{datetime.now().isoformat()} - {msg}"
-    print(timestamped)
-    with open(LOG_FILE, "a") as f:
-        f.write(timestamped + "\n")
 
-import requests
-import json
-with open("config.json") as f:
-    config = json.load(f)
-BOT_token = config.get("bot_token")
-ADMIN_CHAT_ID = config.get("admin_chat_id")
-
-def notify_admin(msg):
+async def run(login=False):
+    config = read_config()
+    logger = setup_logging('userbot')
+    # A distinct session: Pyrogram and Telethon session formats are incompatible.
+    def make_client(api_id, api_hash):
+        return TelegramClient(str(ROOT / 'guard_mtproto'), api_id, api_hash,
+            timeout=10, request_retries=2, connection_retries=5, retry_delay=3,
+            flood_sleep_threshold=0, sequential_updates=True, receive_updates=False)
+    client = None
+    tasks = []
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    fatal = loop.create_future()
+    if not login:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:
+                pass
     try:
-        response = requests.post(
-            url="https://api.telegram.org/bot" + BOT_token + "/sendMessage",
-            json={"chat_id": json.load(open("config.json")).get("admin_chat_id", "me"), "text": msg, "parse_mode": "HTML"}
-        )
-        write_log(f"[notify] отправлено уведомление: {msg}")
-    except Exception as e:
-        print(f"[notify_error] {e}")
-
-    timestamped = f"{datetime.now().isoformat()} - {msg}"
-    print(timestamped)
-    with open(LOG_FILE, "a") as f:
-        f.write(timestamped + "\n")
-
-chat_map = {}  # user_id -> created private chat_id
-app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH)
-
-conn = sqlite3.connect("messages.db", check_same_thread=False)
-cur = conn.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    chat_id INTEGER,
-    message_id INTEGER,
-    user_id INTEGER,
-    username TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    text TEXT,
-    file_path TEXT,
-    date_sent TEXT,
-    deleted INTEGER DEFAULT 0,
-    PRIMARY KEY (chat_id, message_id)
-)
-""")
-conn.commit()
-
-def save_media(message: Message):
-    if message.media:
-        folder = os.path.join(MEDIA_DIR, datetime.now().strftime("%Y-%m-%d"))
-        os.makedirs(folder, exist_ok=True)
-        if message.photo:
-            ext = ".jpg"
-        elif message.video:
-            ext = ".mp4"
-        elif message.voice:
-            ext = ".ogg"
-        elif message.audio:
-            ext = ".mp3"
-        elif message.sticker:
-            ext = os.path.splitext(message.sticker.file_name)[1] if message.sticker.file_name else ".webp"
-        elif message.video_note:
-            ext = ".mp4"
-        elif message.document and message.document.file_name:
-            ext = os.path.splitext(message.document.file_name)[1] or ".bin"
-        else:
-            ext = ".bin"
-        path = os.path.join(folder, f"{message.chat.id}_{message.id}{ext}")
-        path = message.download(file_name=path)
-        if path:
-            write_log(f"[media] Скачано: {path} ({os.path.getsize(path)} байт)")
-        else:
-            write_log("[media] Не удалось скачать медиа")
-        return path
-    return None
-
-@app.on_message(filters.incoming)
-def handle_message(client, message):
-    write_log("[in] сообщение получено")
-    media_path = save_media(message)
-    cur.execute("""
-        INSERT OR REPLACE INTO messages
-        (chat_id, message_id, user_id, username, first_name, last_name, text, file_path, date_sent)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        message.chat.id,
-        message.id,
-        message.from_user.id if message.from_user else None,
-        message.from_user.username if message.from_user else None,
-        message.from_user.first_name if message.from_user else None,
-        message.from_user.last_name if message.from_user else None,
-        message.text or "",
-        media_path,
-        datetime.now().isoformat()
-    ))
-    conn.commit()
-    if media_path:
-        write_log("[db] записано в БД: медиа")
-    else:
-        write_log("[db] записано в БД: текст")
-
-@app.on_deleted_messages()
-def handle_deleted(client, messages):
-    write_log(f"[del] удалено сообщений: {len(messages)}")
-    notify_admin(f"❌ Удалено {len(messages)} сообщений")
-    if not messages:
-        return
-
-    first_msg = messages[0]
-    if not first_msg.chat:
-        cur.execute("SELECT chat_id FROM messages WHERE message_id=? ORDER BY date_sent DESC LIMIT 1", (first_msg.id,))
-        chat_row = cur.fetchone()
-        if chat_row:
-            msg_chat_id = chat_row[0]
-        else:
-            write_log("[fail] не удалось определить chat_id")
-            return
-    else:
-        msg_chat_id = first_msg.chat.id
-
-    cur.execute("SELECT user_id, first_name, last_name, username FROM messages WHERE chat_id=? AND message_id=?", (msg_chat_id, first_msg.id))
-    user_row = cur.fetchone()
-    if not user_row:
-        write_log("[fail] не удалось определить пользователя для обработки")
-        return
-
-    user_id, username, first_name, last_name = user_row
-    username = username or f"user{user_id}"
-
-    if len(messages) >= 10:
-        if user_id not in chat_map:
-            title = f"❌Del {first_name} {last_name} @{username}"
+        if config.get('setup_requested') or not config.get('api_id') or not config.get('api_hash'):
+            wizard = AuthServer(None, int(config['auth_port']), host=config['auth_host'],
+                configure_notifications=True, client_factory=make_client)
             try:
-                chat = client.create_group(title=title, users=["me"])
-                chat_map[user_id] = chat.id
-                write_log(f"[group] создан чат {title} → {chat.id}")
-            except Exception as e:
-                write_log(f"[error] не удалось создать чат: {e}")
-                return
+                if not await wizard.wait(stop):
+                    return 0
+            finally:
+                client = wizard.client
+            config = read_config()
         else:
-            write_log(f"[group] найден чат для {username} → {chat_map[user_id]}")
-        target_chat = chat_map[user_id]
-    else:
-        target_chat = LOG_GROUP_ID
-
-    for msg in messages:
-        cur.execute("SELECT text, file_path FROM messages WHERE chat_id=? AND message_id=?", (msg_chat_id, msg.id))
-        row = cur.fetchone()
-        if not row:
-            write_log(f"[skip] нет записи в БД: chat_id={msg_chat_id}, msg_id={msg.id}")
-            continue
-        text, file_path = row
-
-        if text.strip() or not file_path:
-            try:
-                log = f"❌ Сообщение удалено\n\n👤 Пользователь: {first_name} {last_name}\n @{username or user_id}\n💬 Текст:\n{text or 'Без текста'}"
-                client.send_message(target_chat, log)
-                write_log("[send] отправлен лог текстового сообщения")
-            except Exception as e:
-                write_log(f"[error] send_message: {e}")
-
-        if file_path and os.path.exists(file_path):
-            try:
-                size = os.path.getsize(file_path)
-                write_log(f"[media] отправка файла: {file_path}, размер: {size} байт")
-                client.send_document(target_chat, file_path, caption=f"📎 Медиа удалённого сообщения от {first_name} {last_name} @{username or user_id}")
-                write_log("[media] файл отправлен")
-            except Exception as e:
-                write_log(f"[error] send_document: {e}")
-
-    cur.execute("UPDATE messages SET deleted=1 WHERE chat_id=? AND message_id IN (%s)" %
-                ",".join("?" * len(messages)), [msg_chat_id] + [msg.id for msg in messages])
-    conn.commit()
-
-@app.on_edited_message()
-def handle_edit(client, message):
-    write_log("[edit] сообщение изменено")
-    cur.execute("SELECT text FROM messages WHERE chat_id=? AND message_id=?", (message.chat.id, message.id))
-    old = cur.fetchone()
-    if old and old[0] != (message.text or ""):
-        log = f"✏️ Сообщение изменено\n\n👤 Пользователь: {message.from_user.first_name} @{message.from_user.username or message.from_user.id}\n🧾 Было:\n{old[0]}\n\n📄 Стало:\n{message.text}"
+            client = make_client(int(config['api_id']), config['api_hash'])
+        if login:
+            await client.start()
+            logger.info('Interactive authorization completed; session saved')
+            return 0
+        await asyncio.wait_for(client.connect(), timeout=30)
+        if not await asyncio.wait_for(client.is_user_authorized(), timeout=30):
+            Store(ROOT / 'messages.db').heartbeat('auth_required', 1)
+            logger.warning('Authorization required; open the complete URL from .auth-login.url')
+            if not await web_authorize(client, int(config['auth_port']), stop, host=config['auth_host']):
+                return 0
+        elif not config.get('bot_token'):
+            if not await web_authorize(client, int(config['auth_port']), stop, settings_only=True, host=config['auth_host']):
+                return 0
+        config = read_config()
+        store = Store(ROOT / 'messages.db')
+        store.heartbeat('auth_required', 0)
+        network = Network()
+        media = MediaQueue(client, network, ROOT / 'media', config, logger, store)
+        monitor = StoryMonitor(client, network, store, logger, int(config['stories_poll_seconds']))
+        recovery = Reconciler(client, network, store, logger, config)
+        delivery = Delivery(store, client, network, config, read_config, logger)
+        me = await network.identity(client)
+        await asyncio.to_thread(bind_owner, me.id)
+        store.heartbeat('started_at', time.time())
+        store.heartbeat('last_ok', time.time())
+        store.heartbeat('stories_enabled', int(bool(config['stories_enabled'])))
         try:
-            client.send_message(LOG_GROUP_ID, log)
-            write_log("[ok] текст изменения отправлен")
-        except Exception as e:
-            write_log(f"[error] send_message (edit): {e}")
-        cur.execute("UPDATE messages SET text=? WHERE chat_id=? AND message_id=?", (message.text or "", message.chat.id, message.id))
-        conn.commit()
+            await monitor.refresh_contacts()
+        except AUTH_ERRORS:
+            raise
+        except Exception as error:
+            logger.warning('Contact names refresh pending type=%s',type(error).__name__)
 
-def cleanup():
-    cutoff = (datetime.now() - timedelta(days=14)).isoformat()
-    cur.execute("DELETE FROM messages WHERE date_sent < ?", (cutoff,))
-    conn.commit()
+        def fail(error):
+            logger.error('Capture failed type=%s', type(error).__name__)
+            if not fatal.done():
+                fatal.set_exception(error)
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(cleanup, 'interval', days=1)
-scheduler.start()
+        @client.on(events.NewMessage(incoming=True))
+        async def handle_message(event):
+            try:
+                # Prevent loops when archives arrive in Saved Messages or a chosen log chat.
+                if event.chat_id == me.id or event.chat_id == config['log_chat_id'] or await asyncio.to_thread(store.is_archive_chat, event.chat_id):
+                    return
+                message = event.message
+                # Use cached sender only; metadata capture must not wait for a network lookup.
+                await asyncio.to_thread(store.save, record_message(message, message.sender),
+                                        media_payload=media_bytes(message.media))
+            except Exception as error:
+                fail(error)
 
-write_log("[run] бот запущен ✅")
-app.run()
+        @client.on(events.MessageDeleted())
+        async def handle_deleted(event):
+            try:
+                if await asyncio.to_thread(store.is_archive_chat, event.chat_id):
+                    return
+                await recovery.deletions(event.chat_id, event.deleted_ids)
+            except Exception as error:
+                fail(error)
+
+        @client.on(events.MessageEdited(incoming=True))
+        async def handle_edit(event):
+            try:
+                if event.chat_id == me.id or await asyncio.to_thread(store.is_archive_chat, event.chat_id):
+                    return
+                store.edit(event.chat_id, event.id, event.raw_text or '')
+                store.enrich_metadata(capture(event.message))
+            except Exception as error:
+                fail(error)
+
+        @client.on(events.Raw())
+        async def handle_raw(update):
+            try:
+                await recovery.raw_update(update)
+                if config['stories_enabled']:
+                    await monitor.raw_update(update)
+            except Exception as error:
+                fail(error)
+
+        async def health():
+            while True:
+                if (ROOT / '.notification-setup.request').exists():
+                    await web_authorize(client, int(config['auth_port']), stop, settings_only=True, host=config['auth_host'])
+                if time.monotonic() >= network.paused_until:
+                    await network.identity(client)
+                    store.heartbeat('last_ok', time.time())
+                sd_notify('WATCHDOG=1')
+                await asyncio.sleep(30)
+
+        async def cleanup():
+            while True:
+                removed = await asyncio.to_thread(store.cleanup, int(config['retention_days']), ROOT / 'media')
+                logger.info('Cleanup removed_files=%s', removed)
+                await asyncio.sleep(3600)
+
+        async def contact_names():
+            while True:
+                if not monitor.contacts_refreshed or time.monotonic()-monitor.contacts_refreshed>=3600:
+                    try:
+                        await monitor.refresh_contacts()
+                    except AUTH_ERRORS:
+                        raise
+                    except Exception as error:
+                        logger.warning('Contact names refresh pending type=%s',type(error).__name__)
+                await asyncio.sleep(60)
+
+        tasks = [asyncio.create_task(delivery.run()), asyncio.create_task(media.worker()),
+                 asyncio.create_task(media.worker()), asyncio.create_task(health()),
+                 asyncio.create_task(cleanup()), asyncio.create_task(stop.wait())]
+        if config['stories_enabled']:
+            tasks.append(asyncio.create_task(monitor.run()))
+        else:
+            tasks.append(asyncio.create_task(contact_names()))
+        tasks.append(asyncio.create_task(recovery.run()))
+        if delivery.archive:
+            tasks.append(asyncio.create_task(delivery.archive.maintain()))
+        # Register handlers before fetching missed updates, after a normal connection.
+        await network.call(lambda: client.set_receive_updates(True))
+        await network.call(client.catch_up)
+        sd_notify('READY=1')
+        logger.info('Capture started; stories=%s', config['stories_enabled'])
+        done, _ = await asyncio.wait([*tasks, fatal, client.disconnected],
+                                     return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+        return 0 if stop.is_set() else 1
+    except AUTH_ERRORS:
+        logger.error('Telegram authorization invalid; web login will reopen. Session will be archived.')
+        return 78
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if not fatal.done():
+            fatal.cancel()
+        if client is not None:
+            await asyncio.wait_for(client.disconnect(), timeout=20)
+
+
+async def serve(login=False):
+    while True:
+        result = await run(login)
+        if result != 78 or login:
+            return result
+        # Telethon has closed the session DB in run(). Preserve rejected credentials
+        # before creating a fresh auth key; never reuse Pyrogram's session format.
+        session = ROOT / 'guard_mtproto.session'
+        if session.exists():
+            session.replace(ROOT / f'guard_mtproto.session.rejected.{time.time_ns()}')
+        await asyncio.sleep(3)
+
+
+if __name__ == '__main__':
+    os.umask(0o077)
+    from onboarding import prepare
+    prepare()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--login', action='store_true', help='Interactive Telegram authorization only')
+    args = parser.parse_args()
+    os.chdir(ROOT)  # Legacy relative media paths in messages.db remain valid.
+    try:
+        with instance_lock('userbot'):
+            sys.exit(asyncio.run(serve(args.login)))
+    except KeyboardInterrupt:
+        pass
+    except Exception as error:
+        setup_logging('userbot').error('Service failed type=%s', type(error).__name__)
+        sys.exit(1)

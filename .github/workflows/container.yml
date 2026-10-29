@@ -1,0 +1,46 @@
+name: Build container manually
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  container:
+    if: github.repository == 'TotKirich/tg-antidel-bot'
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test and publish image
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_OWNER: ${{ github.repository_owner }}
+          GH_ACTOR: ${{ github.actor }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GH_REPO,,}"
+          status="$(curl -sS -o "$RUNNER_TEMP/package-before.json" -w '%{http_code}' -H "Authorization: Bearer $REGISTRY_TOKEN" "https://api.github.com/users/$GH_OWNER/packages/container/${GH_REPO#*/}")"
+          if [[ "$status" == 200 ]]; then
+            python -c 'import json,sys; assert json.load(open(sys.argv[1]))["visibility"] in ("private", "public")' "$RUNNER_TEMP/package-before.json"
+          elif [[ "$status" != 404 ]]; then
+            echo "Cannot verify package privacy: HTTP $status"; exit 1
+          fi
+          docker build --target test -t guard-test .
+          docker run --rm --network none guard-test
+          docker build --target runtime --label "org.opencontainers.image.source=https://github.com/$GH_REPO" --label "org.opencontainers.image.revision=$SOURCE_SHA" -t "$image:sha-$SOURCE_SHA" -t "$image:preview" .
+          export DOCKER_CONFIG="$RUNNER_TEMP/guard-docker-auth"
+          mkdir -m 700 "$DOCKER_CONFIG"
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+          docker push "$image:sha-$SOURCE_SHA"
+          docker push "$image:preview"
+          curl --fail --silent --show-error -H "Authorization: Bearer $REGISTRY_TOKEN" "https://api.github.com/users/$GH_OWNER/packages/container/${GH_REPO#*/}" -o "$RUNNER_TEMP/package-after.json"
+          python -c 'import json,sys; assert json.load(open(sys.argv[1]))["visibility"] in ("private", "public")' "$RUNNER_TEMP/package-after.json"
+          echo "Published image: $image:sha-$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,23 @@
+{
+  "api_id": 0,
+  "api_hash": "",
+  "bot_token": "",
+  "admin_username": "",
+  "admin_user_id": null,
+  "admin_chat_id": null,
+  "log_chat_id": "me",
+  "archive_mode": "saved",
+  "retention_days": 14,
+  "max_media_mb": 100,
+  "min_free_mb": 512,
+  "stories_enabled": true,
+  "stories_poll_seconds": 300,
+  "auth_port": 8787,
+  "auth_host": "127.0.0.1",
+  "recheck_hours": 24,
+  "recheck_batch_size": 50,
+  "recheck_interval_seconds": 60,
+  "delivery_interval_seconds": 1,
+  "notify_public_deletions": true,
+  "notifications_enabled": true
+}
