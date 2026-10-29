@@ -19,7 +19,8 @@ class PrebuiltInstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
             for name in ('start.sh','onboarding.py','runtime.py','compose.prebuilt.yaml'):
-                shutil.copyfile(self.project/name,root/name)
+                source=self.project/'app'/name if name.endswith('.py') and (self.project/'app'/name).is_file() else self.project/name
+                shutil.copyfile(source,root/name)
             command_log=root/'commands'; bin=root/'bin'; bin.mkdir()
             docker=bin/'docker'
             docker.write_text('''#!/usr/bin/env python3

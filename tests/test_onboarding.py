@@ -149,7 +149,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         stream=io.StringIO()
         with redirect_stdout(stream):
             self.assertFalse(wait_for_link(self.root,timeout=.01))
-        self.assertNotIn('Связь с Telegram подтверждена',stream.getvalue())
+        self.assertNotIn('РЎРІСЏР·СЊ СЃ Telegram РїРѕРґС‚РІРµСЂР¶РґРµРЅР°',stream.getvalue())
 
     async def test_bound_owner_cannot_silently_change_after_restart(self):
         from runtime import update_config,bind_owner
@@ -186,12 +186,13 @@ with open(os.environ['COMMAND_LOG'],'a') as f: f.write(' '.join(sys.argv[1:])+'\
 args=sys.argv[1:]
 if 'onboarding.py' in args:
     tail=args[args.index('onboarding.py')+1:]
-    raise SystemExit(subprocess.call([sys.executable,'onboarding.py',*tail]))
+    raise SystemExit(subprocess.call([sys.executable,os.environ['TEST_ONBOARDING_PATH'],*tail]))
 if 'up' in args:
     (pathlib.Path(os.environ['TG_GUARD_DATA_DIR'])/'.auth-login.url').write_text('http://127.0.0.1:8080/#fixture-key')
 ''')
             docker.chmod(0o700)
             env=dict(os.environ,PATH=str(root)+os.pathsep+os.environ['PATH'],
+                TEST_ONBOARDING_PATH=str(project/'app/onboarding.py' if (project/'app/onboarding.py').is_file() else project/'onboarding.py'),
                 TG_GUARD_DATA_DIR=str(root/'data'),COMMAND_LOG=str(commands),TG_GUARD_AUTH_HOST='127.0.0.1')
             result=subprocess.run(['bash',str(project/'start.sh'),'--docker'],env=env,capture_output=True,text=True,timeout=15,check=True)
             self.assertIn('http://127.0.0.1:8080/#fixture-key',result.stdout)

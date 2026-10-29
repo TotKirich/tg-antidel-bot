@@ -6,7 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && groupadd --gid 1000 guard \
     && useradd --uid 1000 --gid 1000 --no-create-home guard \
     && mkdir /data && chown guard:guard /data
-COPY --chmod=0644 *.py config.example.json ./
+COPY --chmod=0644 app/*.py config.example.json ./
 USER guard
 
 FROM base AS test
