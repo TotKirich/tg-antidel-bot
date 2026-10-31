@@ -160,22 +160,37 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.save(chat=42))
         self.assertTrue(self.save(chat=-123))
 
-    async def test_username_blocks_both_only_for_joined_channels_and_paginates(self):
+    async def test_username_lookup_only_finds_joined_channels_and_does_not_toggle(self):
         await self.policy.refresh()
         for number in range(200,214):
             self.store.set_channel_membership(-1000000000000-number,True,title=f'Channel {number}')
         rows,page,count=self.store.channel_page(1)
         self.assertEqual((len(rows),page,count),(6,1,15))
-        self.assertEqual(self.store.block_channel_username('FIXTURE_CHANNEL'),CHANNEL)
+        self.assertEqual(self.store.find_channel_username('FIXTURE_CHANNEL')['chat_id'],CHANNEL)
         row=self.store.channel_state(CHANNEL)
-        self.assertFalse(row['capture_enabled'] or row['notifications_enabled'])
+        self.assertTrue(row['capture_enabled'] and row['notifications_enabled'])
         self.store.set_channel_membership(CHANNEL,False,username='fixture_channel')
-        self.assertIsNone(self.store.block_channel_username('fixture_channel'))
+        self.assertIsNone(self.store.find_channel_username('fixture_channel'))
 
     async def test_restart_requires_subscription_revalidation(self):
         await self.policy.refresh()
         ChannelPolicy(self.client,Network(),self.store,Mock())
         self.assertFalse(self.store.channel_allowed(CHANNEL))
+
+    async def test_temporary_membership_uncertainty_preserves_pending_archive(self):
+        await self.policy.refresh()
+        self.save()
+        self.store.deleted(CHANNEL,1)
+        pending=self.store.pending()
+        self.store.invalidate_channel(CHANNEL)
+        sender=NS(send_message=AsyncMock())
+        delivery=Delivery(self.store,sender,Network(),dict(log_chat_id='me',delivery_interval_seconds=0),lambda:{},Mock())
+        await delivery.once()
+        sender.send_message.assert_not_awaited()
+        with self.store.connection() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],len(pending))
+        await self.policy.refresh()
+        self.assertTrue(all(self.store.delivery_allowed(job) for job in pending))
 
     async def test_real_capture_handlers_ignore_preview_messages_edits_and_deletions(self):
         channel = peer(left=True)
@@ -220,7 +235,7 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
             await delivery.once()
         post.assert_not_called()
 
-    async def test_bot_section_username_scope_exit_and_callback_authorisation(self):
+    async def test_bot_global_username_current_status_and_callback_authorisation(self):
         await self.policy.refresh()
         (self.root/'config.json').write_text(json.dumps(dict(bot_token='fixture',admin_user_id=42,
             admin_chat_id=42,notifications_enabled=True)),encoding='utf-8')
@@ -243,17 +258,29 @@ class ChannelTests(unittest.IsolatedAsyncioTestCase):
                 msg=NS(text='@fixture_channel',from_user=NS(id=42),chat=NS(id=42,type='private'),message_id=1)
                 bot.handlers['handle'](msg)
                 self.assertTrue(store.channel_state(CHANNEL)['capture_enabled'])
+                self.assertIn('Сохранение: включено',bot.sent[-1][0][1])
                 msg.text='🎯 Отключить точечно';bot.handlers['handle'](msg)
                 self.assertTrue(any((b.callback_data or '').startswith('channels:open:')
                     for row in bot.sent[-1][1]['reply_markup'].keyboard for b in row))
                 msg.text='@FIXTURE_CHANNEL';bot.handlers['handle'](msg)
-                self.assertFalse(store.channel_state(CHANNEL)['capture_enabled'])
-                call=NS(id='callback',data=f'channels:save:{CHANNEL}:1:0',message=msg,from_user=NS(id=99))
+                self.assertTrue(store.channel_state(CHANNEL)['capture_enabled'])
+                call=NS(id='callback',data=f'channels:save:{CHANNEL}:0:0',message=msg,from_user=NS(id=99))
                 bot.callback(call)
-                self.assertFalse(store.channel_state(CHANNEL)['capture_enabled'])
+                self.assertTrue(store.channel_state(CHANNEL)['capture_enabled'])
                 call.from_user=NS(id=42);bot.callback(call)
+                self.assertFalse(store.channel_state(CHANNEL)['capture_enabled'])
+                self.assertIn('Сохранение: выключено',bot.edited[-1][0][0])
+                call.data=f'channels:notify:{CHANNEL}:0:0';bot.callback(call)
+                call.data=f'channels:save:{CHANNEL}:1:0';bot.callback(call)
                 self.assertTrue(store.channel_state(CHANNEL)['capture_enabled'])
                 self.assertFalse(store.channel_state(CHANNEL)['notifications_enabled'])
+                self.assertIn('Уведомления: выключены',bot.edited[-1][0][0])
+                msg.text='🎯 Отключить точечно';bot.handlers['handle'](msg)
+                self.assertTrue(any('💾 вкл · 🔔 выкл' in b.text
+                    for row in bot.sent[-1][1]['reply_markup'].keyboard for b in row))
+                store.set_channel_option(CHANNEL,'notifications_enabled',True)
+                call.data=f'channels:open:{CHANNEL}:0';bot.callback(call)
+                self.assertIn('Уведомления: включены',bot.edited[-1][0][0])
                 self.assertTrue(bot.edited)
                 call.data='channels:exit';bot.callback(call)
                 msg.text='@fixture_channel';bot.handlers['handle'](msg)

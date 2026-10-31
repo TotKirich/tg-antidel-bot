@@ -205,7 +205,11 @@ class Delivery:
         self.store.flush_digests()
         for job in self.store.pending():
             try:
-                if not self.store.delivery_allowed(job):
+                disposition = self.store.delivery_disposition(job)
+                if disposition=='wait':
+                    self.store.retry(job['id'],30)
+                    continue
+                if disposition=='drop':
                     self.store.acknowledge(job['id'])
                     continue
                 await asyncio.sleep(max(0, self.next_send_at - time.monotonic()))

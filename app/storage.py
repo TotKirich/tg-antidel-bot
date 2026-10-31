@@ -130,6 +130,7 @@ class Store:
     def activate_channel_policy(self):
         with self.connection() as db:
             db.execute("INSERT OR REPLACE INTO health VALUES ('channel_policy_active','1')")
+            db.execute("INSERT OR REPLACE INTO health VALUES ('channels_synced','0')")
             db.execute('UPDATE channel_settings SET verified_at=0')
 
     @staticmethod
@@ -199,16 +200,13 @@ class Store:
             return bool(db.execute(f'''UPDATE channel_settings SET {option}=?
                 WHERE chat_id=? AND subscribed=1 AND is_broadcast=1''', (int(enabled),chat_id)).rowcount)
 
-    def block_channel_username(self, username):
+    def find_channel_username(self, username):
         with self.connection() as db:
-            db.execute('BEGIN IMMEDIATE')
-            rows = db.execute('''SELECT chat_id FROM channel_settings WHERE username=? COLLATE NOCASE
+            rows = db.execute('''SELECT * FROM channel_settings WHERE username=? COLLATE NOCASE
                 AND subscribed=1 AND is_broadcast=1''', (username,)).fetchall()
             if len(rows)!=1:
                 return None
-            chat_id = rows[0]['chat_id']
-            db.execute('UPDATE channel_settings SET capture_enabled=0,notifications_enabled=0 WHERE chat_id=?', (chat_id,))
-            return chat_id
+            return dict(rows[0])
 
     @staticmethod
     def source_chat_id(job):
@@ -230,6 +228,22 @@ class Store:
                 if db.execute("SELECT 1 FROM health WHERE name='channel_policy_active' AND value='1'").fetchone():
                     return False
         return self.channel_allowed(chat_id, notifications=job['kind']=='notify')
+
+    def delivery_disposition(self, job):
+        if self.delivery_allowed(job):
+            return 'send'
+        chat_id = self.source_chat_id(job)
+        row = self.channel_state(chat_id)
+        if row and row['subscribed'] and row['capture_enabled'] and (
+                job['kind']!='notify' or row['notifications_enabled']):
+            # A temporarily stale membership check must not destroy a durable job.
+            return 'wait'
+        if row is None and chat_id is not None:
+            with self.connection() as db:
+                synced = db.execute("SELECT value FROM health WHERE name='channels_synced'").fetchone()
+            if not synced or float(synced[0]) < time.time()-600:
+                return 'wait'
+        return 'drop'
 
     @contextmanager
     def connection(self):
