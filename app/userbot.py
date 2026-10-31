@@ -8,6 +8,7 @@ import time
 
 from telethon import TelegramClient, events
 from authweb import AuthServer, web_authorize
+from channels import ChannelPolicy
 from recovery import Reconciler
 from message_metadata import capture
 from runtime import ROOT, bind_owner, instance_lock, read_config, sd_notify, setup_logging
@@ -66,8 +67,10 @@ async def run(login=False):
                 return 0
         config = read_config()
         store = Store(ROOT / 'messages.db')
+        # Activate the fail-closed broadcast filter before any queue can run.
         store.heartbeat('auth_required', 0)
         network = Network()
+        channels = ChannelPolicy(client, network, store, logger)
         media = MediaQueue(client, network, ROOT / 'media', config, logger, store)
         monitor = StoryMonitor(client, network, store, logger, int(config['stories_poll_seconds']))
         recovery = Reconciler(client, network, store, logger, config)
@@ -77,6 +80,12 @@ async def run(login=False):
         store.heartbeat('started_at', time.time())
         store.heartbeat('last_ok', time.time())
         store.heartbeat('stories_enabled', int(bool(config['stories_enabled'])))
+        try:
+            await channels.refresh()
+        except AUTH_ERRORS:
+            raise
+        except Exception as error:
+            logger.warning('Channel subscription sync pending type=%s',type(error).__name__)
         try:
             await monitor.refresh_contacts()
         except AUTH_ERRORS:
@@ -96,8 +105,14 @@ async def run(login=False):
                 if event.chat_id == me.id or event.chat_id == config['log_chat_id'] or await asyncio.to_thread(store.is_archive_chat, event.chat_id):
                     return
                 message = event.message
+                if not await channels.admit(event.chat_id, getattr(message, 'chat', None)):
+                    return
                 # Use cached sender only; metadata capture must not wait for a network lookup.
-                await asyncio.to_thread(store.save, record_message(message, message.sender),
+                record = record_message(message, message.sender)
+                state = store.channel_state(event.chat_id) if event.chat_id < -1000000000000 else None
+                if state and state['is_broadcast']:
+                    record.update(chat_type='channel', chat_title=state['title'], chat_username=state['username'])
+                await asyncio.to_thread(store.save, record,
                                         media_payload=media_bytes(message.media))
             except Exception as error:
                 fail(error)
@@ -105,7 +120,7 @@ async def run(login=False):
         @client.on(events.MessageDeleted())
         async def handle_deleted(event):
             try:
-                if await asyncio.to_thread(store.is_archive_chat, event.chat_id):
+                if await asyncio.to_thread(store.is_archive_chat, event.chat_id) or not await channels.admit(event.chat_id):
                     return
                 await recovery.deletions(event.chat_id, event.deleted_ids)
             except Exception as error:
@@ -116,6 +131,8 @@ async def run(login=False):
             try:
                 if event.chat_id == me.id or await asyncio.to_thread(store.is_archive_chat, event.chat_id):
                     return
+                if not await channels.admit(event.chat_id, getattr(event.message, 'chat', None)):
+                    return
                 store.edit(event.chat_id, event.id, event.raw_text or '')
                 store.enrich_metadata(capture(event.message))
             except Exception as error:
@@ -124,6 +141,7 @@ async def run(login=False):
         @client.on(events.Raw())
         async def handle_raw(update):
             try:
+                await channels.raw_update(update)
                 await recovery.raw_update(update)
                 if config['stories_enabled']:
                     await monitor.raw_update(update)
@@ -165,6 +183,7 @@ async def run(login=False):
         else:
             tasks.append(asyncio.create_task(contact_names()))
         tasks.append(asyncio.create_task(recovery.run()))
+        tasks.append(asyncio.create_task(channels.run()))
         if delivery.archive:
             tasks.append(asyncio.create_task(delivery.archive.maintain()))
         # Register handlers before fetching missed updates, after a normal connection.

@@ -108,6 +108,8 @@ class SettingsTests(unittest.IsolatedAsyncioTestCase):
                     return fn
                 return register
             def send_message(self, *args, **kwargs): self.sent.append((args,kwargs))
+            def callback_query_handler(self, **kwargs):
+                return lambda fn: fn
             def stop_polling(self): pass
             def infinity_polling(self, **kwargs):
                 msg = NS(text='🔕 Паблики: выключить', from_user=NS(id=42), chat=NS(id=42, type='private'))

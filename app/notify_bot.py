@@ -1,6 +1,7 @@
 """Administrator controls and health status. Importing never starts polling."""
 import time
 import threading
+import re
 
 from runtime import ROOT, authorised, instance_lock, read_config, setup_logging, update_config
 from storage import Store
@@ -14,6 +15,7 @@ def run_bot(token):
     apihelper.CONNECT_TIMEOUT = 5
     apihelper.READ_TIMEOUT = 30
     bot = telebot.TeleBot(token, threaded=False)
+    channel_sessions = {}
 
     def allowed(message):
         if authorised(read_config(), message.from_user, message.chat):
@@ -21,10 +23,91 @@ def run_bot(token):
         bot.send_message(message.chat.id, '⛔ У вас нет доступа.')
         return False
 
+    def channel_menu(chat_id, page=0, selected=None, message_id=None):
+        channel_sessions[chat_id] = time.monotonic() + 600
+        if not (ROOT / 'messages.db').exists():
+            bot.send_message(chat_id, 'Список пабликов появится после запуска сервиса.')
+            return
+        store = Store(ROOT / 'messages.db')
+        rows, page, count = store.channel_page(page)
+        markup = telebot.types.InlineKeyboardMarkup()
+        if selected is None:
+            body = ('🎯 Отключить точечно\nТолько каналы, на которые вы подписаны. Выберите канал.\n'
+                    '💾 — сохранение и архив, 🔔 — уведомления бота.\n'
+                    'Или отправьте @логин канала: отключатся и сохранение, и уведомления.\n'
+                    'Общий переключатель уведомлений и фильтр пабликов также действуют.')
+            for row in rows:
+                title = row['title'] or ('@'+row['username'] if row['username'] else 'Без названия')
+                state = ('💾' if row['capture_enabled'] else '⏸') + (' 🔔' if row['notifications_enabled'] else ' 🔕')
+                markup.add(telebot.types.InlineKeyboardButton(state+' '+title[:55],
+                    callback_data=f"channels:open:{row['chat_id']}:{page}"))
+            if not count:
+                body += '\nПодписанных каналов пока нет или список ещё не обновлён.'
+            navigation = []
+            if page:
+                navigation.append(telebot.types.InlineKeyboardButton('←',callback_data=f'channels:list:{page-1}'))
+            if (page+1)*6<count:
+                navigation.append(telebot.types.InlineKeyboardButton('→',callback_data=f'channels:list:{page+1}'))
+            if navigation:
+                markup.row(*navigation)
+        else:
+            row = store.channel_state(selected)
+            if not row or not row['subscribed'] or not row['is_broadcast']:
+                bot.send_message(chat_id, 'Канал больше не находится в списке подписок. Откройте список заново.')
+                return
+            title = row['title'] or ('@'+row['username'] if row['username'] else 'Без названия')
+            body = f"📢 {title}\nСохранение: {'включено' if row['capture_enabled'] else 'выключено'}"
+            body += f"\nУведомления: {'включены' if row['notifications_enabled'] else 'выключены'}"
+            body += ('\nОтключение сохранения останавливает новые записи, правки, перепроверки и отправку в архив. '
+                     'Ранее сохранённые данные не удаляются. Уведомления требуют включённого сохранения.')
+            for option, label in [('capture_enabled','💾 Сохранение'),('notifications_enabled','🔔 Уведомления')]:
+                action = 'выключить' if row[option] else 'включить'
+                short = 'save' if option=='capture_enabled' else 'notify'
+                markup.add(telebot.types.InlineKeyboardButton(label+': '+action,
+                    callback_data=f"channels:{short}:{selected}:{1-int(row[option])}:{page}"))
+            markup.add(telebot.types.InlineKeyboardButton('← Список',callback_data=f'channels:list:{page}'))
+        markup.add(telebot.types.InlineKeyboardButton('Закрыть раздел',callback_data='channels:exit'))
+        if message_id is not None:
+            bot.edit_message_text(body,chat_id=chat_id,message_id=message_id,reply_markup=markup)
+        else:
+            bot.send_message(chat_id,body,reply_markup=markup)
+
+    @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith('channels:')))
+    def channels_callback(call):
+        message = getattr(call,'message',None)
+        if message is None or not authorised(read_config(),call.from_user,message.chat):
+            bot.answer_callback_query(call.id,'Нет доступа.')
+            return
+        data = call.data or ''
+        if data=='channels:exit':
+            channel_sessions.pop(message.chat.id,None)
+            bot.answer_callback_query(call.id)
+            bot.send_message(message.chat.id,'Раздел закрыт. Ввод логина больше не меняет настройки.')
+            return
+        match = re.fullmatch(r'channels:list:(\d{1,6})',data)
+        if match:
+            bot.answer_callback_query(call.id)
+            channel_menu(message.chat.id,int(match[1]),message_id=getattr(message,'message_id',None))
+            return
+        match = re.fullmatch(r'channels:(open|save|notify):(-\d{10,16}):(?:(0|1):)?(\d{1,6})',data)
+        if not match or (match[1]=='open') != (match[3] is None):
+            bot.answer_callback_query(call.id,'Некорректная кнопка.')
+            return
+        action, chat_id, enabled, page = match[1],int(match[2]),match[3],int(match[4])
+        if action!='open':
+            store = Store(ROOT/'messages.db')
+            option = 'capture_enabled' if action=='save' else 'notifications_enabled'
+            if not store.set_channel_option(chat_id,option,enabled=='1'):
+                bot.answer_callback_query(call.id,'Канал больше не в подписках.')
+                return
+        bot.answer_callback_query(call.id,'Сохранено.' if action!='open' else None)
+        channel_menu(message.chat.id,page,chat_id,message_id=getattr(message,'message_id',None))
+
     @bot.message_handler(commands=['start', 'status'])
     def start(message):
         if not allowed(message):
             return
+        channel_sessions.pop(message.chat.id,None)
         config = read_config()
         if config['notifications_enabled']:
             update_config(dict(admin_chat_id=message.from_user.id))
@@ -32,6 +115,7 @@ def run_bot(token):
         markup.add('✅ Включить уведомления', '🚫 Выключить уведомления')
         markup.add('📢 Паблики: включить', '🔕 Паблики: выключить')
         markup.add('📊 Статус')
+        markup.add('🎯 Отключить точечно')
         state = 'включены' if config.get('admin_chat_id') else 'выключены'
         body = f'Уведомления {state}.'
         body += '\nУдаления из каналов: ' + ('включены' if config['notify_public_deletions'] else 'выключены')
@@ -57,13 +141,22 @@ def run_bot(token):
             body += '\nUserbot ещё не создал БД.'
         bot.send_message(message.chat.id, body, reply_markup=markup)
 
+    @bot.message_handler(commands=['channels'])
+    def channels_command(message):
+        if allowed(message):
+            channel_menu(message.chat.id)
+
     @bot.message_handler(content_types=['text'])
     def handle(message):
         if not allowed(message):
             return
         config = read_config()
+        if message.text not in ('🎯 Отключить точечно','⚙️ Паблики') and not re.fullmatch(r'@?[A-Za-z][A-Za-z0-9_]{3,31}',message.text or ''):
+            channel_sessions.pop(message.chat.id,None)
         if message.text in ('📊 Статус', 'Статус'):
             start(message)
+        elif message.text in ('🎯 Отключить точечно','⚙️ Паблики'):
+            channel_menu(message.chat.id)
         elif message.text == '✅ Включить уведомления':
             update_config(dict(admin_user_id=message.from_user.id, admin_chat_id=message.chat.id, notifications_enabled=True))
             bot.send_message(message.chat.id, '✅ Уведомления включены.')
@@ -74,11 +167,22 @@ def run_bot(token):
             enabled = message.text.startswith('📢')
             update_config(dict(notify_public_deletions=enabled))
             bot.send_message(message.chat.id, 'Уведомления удаления из каналов ' + ('включены.' if enabled else 'выключены. Архив продолжает сохраняться.'))
+        elif channel_sessions.get(message.chat.id,0)>time.monotonic():
+            username = (message.text or '').removeprefix('@')
+            if re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{3,31}',username):
+                store = Store(ROOT/'messages.db')
+                chat_id = store.block_channel_username(username)
+                if chat_id is None:
+                    bot.send_message(message.chat.id,'Канал не найден среди ваших подписок. Список обновляется автоматически; попробуйте выбрать его кнопкой.')
+                else:
+                    bot.send_message(message.chat.id,'Сохранение и уведомления для @'+username+' выключены.')
+                    channel_menu(message.chat.id,selected=chat_id)
 
     @bot.message_handler(commands=['settings', 'check_bot'])
     def settings(message):
         if not allowed(message):
             return
+        channel_sessions.pop(message.chat.id,None)
         if message.text.split()[0].split('@')[0] == '/settings':
             (ROOT / '.notification-setup.request').touch()
             bot.send_message(message.chat.id, 'Форма проверки/замены токена откроется в течение 30 секунд. Откройте полную ссылку из .auth-login.url на сервере. Для loopback-адреса нужен SSH-туннель. Токен сюда не отправляйте.')
@@ -105,7 +209,7 @@ def run_bot(token):
 
     logger.info('Notification bot started')
     try:
-        bot.infinity_polling(timeout=20, long_polling_timeout=20, allowed_updates=['message'])
+        bot.infinity_polling(timeout=20, long_polling_timeout=20, allowed_updates=['message','callback_query'])
     finally:
         finished.set()
         bot.stop_polling()

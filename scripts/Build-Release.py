@@ -12,10 +12,10 @@ FILES = [
     'start.sh', 'install.sh', 'compose.prebuilt.yaml', '.github/workflows/container.yml', 'scripts/Install-Docker.sh',
     'app/userbot.py', 'app/notify_bot.py', 'app/runtime.py', 'app/storage.py', 'app/transport.py', 'app/stories.py',
     'app/authweb.py', 'app/recovery.py', 'app/message_metadata.py', 'app/notification_setup.py', 'app/docker_watchdog.py',
-    'app/archive.py', 'app/onboarding.py', 'scripts/Build-Release.py',
+    'app/archive.py', 'app/channels.py', 'app/onboarding.py', 'scripts/Build-Release.py',
     'tests/test_guard.py', 'tests/test_authweb.py', 'tests/test_recovery.py',
     'tests/test_bulk_and_metadata.py', 'tests/test_notification_settings.py',
-    'tests/test_archive.py', 'tests/test_onboarding.py', 'tests/test_release.py', 'tests/test_docker_install.py', 'tests/test_prebuilt_install.py',
+    'tests/test_archive.py', 'tests/test_onboarding.py', 'tests/test_release.py', 'tests/test_docker_install.py', 'tests/test_prebuilt_install.py', 'tests/test_channels.py',
 ]
 
 

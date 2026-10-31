@@ -89,6 +89,8 @@ class MediaQueue:
 
     async def refresh(self, job):
         if job['kind'] == 'message':
+            if not self.store.channel_allowed(job['owner_id']):
+                raise LookupError('Channel capture disabled')
             message = await self.network.call(lambda: self.client.get_messages(
                 job['owner_id'], ids=job['item_id']))
             media = message.media if (message and message.id == job['item_id']
@@ -132,6 +134,8 @@ class MediaQueue:
             reserve = int(self.config['min_free_mb']) * 1024 * 1024
 
             def progress(current, total):
+                if job['kind']=='message' and not self.store.channel_allowed(job['owner_id']):
+                    raise LookupError('Channel capture disabled')
                 if max(current, total) > limit or shutil.disk_usage(self.root).free < reserve:
                     raise ValueError('Media quota reached')
 
@@ -201,6 +205,9 @@ class Delivery:
         self.store.flush_digests()
         for job in self.store.pending():
             try:
+                if not self.store.delivery_allowed(job):
+                    self.store.acknowledge(job['id'])
+                    continue
                 await asyncio.sleep(max(0, self.next_send_at - time.monotonic()))
                 self.next_send_at = time.monotonic() + float(self.config.get('delivery_interval_seconds', 1))
                 target = self.config['log_chat_id']
@@ -213,7 +220,9 @@ class Delivery:
                     job['text'] = self.archive.refresh_author(job)
                 text, entities = rich_text(job['text'])
                 if job['kind'] == 'notify':
-                    await asyncio.to_thread(self.notify, job['text'], bool(job.get('public_source')))
+                    channel = self.store.channel_state(self.store.source_chat_id(job))
+                    public_source = bool(job.get('public_source') or (channel and channel['is_broadcast']))
+                    await asyncio.to_thread(self.notify, job['text'], public_source)
                 elif job['kind'] == 'media':
                     if Path(job['file_path']).is_file():
                         await self.network.transfer(lambda progress: self.client.send_file(target, job['file_path'],

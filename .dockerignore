@@ -3,6 +3,7 @@
 !requirements.txt
 !config.example.json
 !app/
+!app/channels.py
 !app/userbot.py
 !app/notify_bot.py
 !app/runtime.py

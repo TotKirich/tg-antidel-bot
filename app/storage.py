@@ -44,7 +44,7 @@ class Store:
     def __init__(self, path):
         self.path = str(path)
         with self.connection() as db:
-            if db.execute('PRAGMA user_version').fetchone()[0] > 7:
+            if db.execute('PRAGMA user_version').fetchone()[0] > 8:
                 raise RuntimeError('Database schema is newer than this application')
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('''CREATE TABLE IF NOT EXISTS messages (
@@ -118,7 +118,118 @@ class Store:
                 chat_id INTEGER, message_id INTEGER, PRIMARY KEY(chat_id,message_id))''')
             db.execute('''CREATE TABLE IF NOT EXISTS contact_names (
                 user_id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, username TEXT, updated_at REAL)''')
-            db.execute('PRAGMA user_version=7')
+            db.execute('''CREATE TABLE IF NOT EXISTS channel_settings (
+                chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '',
+                is_broadcast INTEGER NOT NULL DEFAULT 1, subscribed INTEGER NOT NULL DEFAULT 0,
+                capture_enabled INTEGER NOT NULL DEFAULT 1, notifications_enabled INTEGER NOT NULL DEFAULT 1,
+                verified_at REAL NOT NULL DEFAULT 0)''')
+            if 'source_chat_id' not in {r['name'] for r in db.execute('PRAGMA table_info(outbox)')}:
+                db.execute('ALTER TABLE outbox ADD COLUMN source_chat_id INTEGER')
+            db.execute('PRAGMA user_version=8')
+
+    def activate_channel_policy(self):
+        with self.connection() as db:
+            db.execute("INSERT OR REPLACE INTO health VALUES ('channel_policy_active','1')")
+            db.execute('UPDATE channel_settings SET verified_at=0')
+
+    @staticmethod
+    def channel_clause(owner):
+        # Column names passed here are internal constants, never bot input.
+        return f'''(NOT EXISTS (SELECT 1 FROM health WHERE name='channel_policy_active' AND value='1')
+            OR {owner}>-1000000000000 OR EXISTS (SELECT 1 FROM channel_settings c
+            WHERE c.chat_id={owner} AND (c.is_broadcast=0 OR
+            (c.subscribed=1 AND c.capture_enabled=1 AND c.verified_at>strftime('%s','now')-600))))'''
+
+    @classmethod
+    def channel_permitted(cls, db, chat_id, notifications=False):
+        if chat_id is None or chat_id > -1000000000000:
+            return True
+        allowed = bool(db.execute(f'SELECT {cls.channel_clause("?")}',
+                                 (chat_id, chat_id)).fetchone()[0])
+        if allowed and notifications:
+            row = db.execute('SELECT is_broadcast,notifications_enabled FROM channel_settings WHERE chat_id=?', (chat_id,)).fetchone()
+            return row is None or not row['is_broadcast'] or bool(row['notifications_enabled'])
+        return allowed
+
+    def channel_allowed(self, chat_id, notifications=False):
+        with self.connection() as db:
+            return self.channel_permitted(db, chat_id, notifications)
+
+    def channel_state(self, chat_id):
+        with self.connection() as db:
+            row = db.execute('SELECT * FROM channel_settings WHERE chat_id=?', (chat_id,)).fetchone()
+            return dict(row) if row else None
+
+    def set_channel_membership(self, chat_id, subscribed, title='', username='', is_broadcast=True):
+        with self.connection() as db:
+            db.execute('''INSERT INTO channel_settings(chat_id,title,username,is_broadcast,subscribed,verified_at)
+                VALUES (?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET
+                title=CASE WHEN excluded.title!='' THEN excluded.title ELSE title END,
+                username=excluded.username,is_broadcast=excluded.is_broadcast,
+                subscribed=excluded.subscribed,verified_at=excluded.verified_at''',
+                (chat_id, label(title, 100), label(username, 40), int(is_broadcast), int(subscribed), time.time()))
+
+    def invalidate_channel(self, chat_id):
+        with self.connection() as db:
+            db.execute('UPDATE channel_settings SET verified_at=0 WHERE chat_id=?', (chat_id,))
+
+    def sync_channels(self, peers):
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('UPDATE channel_settings SET subscribed=0 WHERE is_broadcast=1')
+            for peer in peers:
+                db.execute('''INSERT INTO channel_settings(chat_id,title,username,is_broadcast,subscribed,verified_at)
+                    VALUES (?,?,?,?,1,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,
+                    username=excluded.username,is_broadcast=excluded.is_broadcast,subscribed=1,verified_at=excluded.verified_at''',
+                    (peer['chat_id'], label(peer['title'],100), label(peer['username'],40), int(peer['is_broadcast']), time.time()))
+            db.execute("INSERT OR REPLACE INTO health VALUES ('channels_synced',?)", (str(time.time()),))
+
+    def channel_page(self, page=0, size=6):
+        with self.connection() as db:
+            count = db.execute('SELECT COUNT(*) FROM channel_settings WHERE is_broadcast=1 AND subscribed=1').fetchone()[0]
+            page = min(max(0, page), max(0, (count-1)//size))
+            rows = db.execute('''SELECT * FROM channel_settings WHERE is_broadcast=1 AND subscribed=1
+                ORDER BY title COLLATE NOCASE,chat_id LIMIT ? OFFSET ?''', (size, page*size))
+            return [dict(row) for row in rows], page, count
+
+    def set_channel_option(self, chat_id, option, enabled):
+        if option not in ('capture_enabled','notifications_enabled') or type(enabled) is not bool:
+            raise ValueError('Invalid channel option')
+        with self.connection() as db:
+            return bool(db.execute(f'''UPDATE channel_settings SET {option}=?
+                WHERE chat_id=? AND subscribed=1 AND is_broadcast=1''', (int(enabled),chat_id)).rowcount)
+
+    def block_channel_username(self, username):
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rows = db.execute('''SELECT chat_id FROM channel_settings WHERE username=? COLLATE NOCASE
+                AND subscribed=1 AND is_broadcast=1''', (username,)).fetchall()
+            if len(rows)!=1:
+                return None
+            chat_id = rows[0]['chat_id']
+            db.execute('UPDATE channel_settings SET capture_enabled=0,notifications_enabled=0 WHERE chat_id=?', (chat_id,))
+            return chat_id
+
+    @staticmethod
+    def source_chat_id(job):
+        chat_id = job.get('source_chat_id')
+        if chat_id is None:
+            # Upgrade queues from v7 without parsing text or inventing an author.
+            parts = job['event_key'].split(':')
+            if len(parts)>1 and parts[0] in ('delete','edit','digest','forum-replay'):
+                try:
+                    chat_id = int(parts[1])
+                except ValueError:
+                    pass
+        return chat_id
+
+    def delivery_allowed(self, job):
+        chat_id = self.source_chat_id(job)
+        if chat_id is None and job.get('public_source'):
+            with self.connection() as db:
+                if db.execute("SELECT 1 FROM health WHERE name='channel_policy_active' AND value='1'").fetchone():
+                    return False
+        return self.channel_allowed(chat_id, notifications=job['kind']=='notify')
 
     @contextmanager
     def connection(self):
@@ -131,20 +242,20 @@ class Store:
             db.close()
 
     @staticmethod
-    def enqueue(db, key, kind, text, file_path=None, public_source=False, archive_key=None, archive_title=None):
-        db.execute('''INSERT OR IGNORE INTO outbox(event_key,kind,text,file_path,created_at,priority,public_source,archive_key,archive_title)
-                      VALUES (?,?,?,?,?,?,?,?,?)''', (key, kind, text, file_path, time.time(), 0 if kind == 'notify' else 1,
-                      int(public_source), archive_key, archive_title))
+    def enqueue(db, key, kind, text, file_path=None, public_source=False, archive_key=None, archive_title=None, source_chat_id=None):
+        db.execute('''INSERT OR IGNORE INTO outbox(event_key,kind,text,file_path,created_at,priority,public_source,archive_key,archive_title,source_chat_id)
+                      VALUES (?,?,?,?,?,?,?,?,?,?)''', (key, kind, text, file_path, time.time(), 0 if kind == 'notify' else 1,
+                      int(public_source), archive_key, archive_title, source_chat_id))
 
     @staticmethod
     def archive_context(row):
         if row['user_id'] and row['user_id'] > 0 and row['sender_kind'] not in ('channel', 'sender_chat'):
             title = ' '.join(filter(None, (row['first_name'], row['last_name']))) or row['username']
             return dict(archive_key=f"user:{row['user_id']}",
-                        archive_title=label(title or f"Пользователь {row['user_id']}", 90))
+                        archive_title=label(title or f"Пользователь {row['user_id']}", 90), source_chat_id=row['chat_id'])
         title = row['chat_title'] or ' '.join(filter(None, (row['first_name'], row['last_name'])))
         return dict(archive_key=f"chat:{row['chat_id']}",
-                    archive_title=label(title or f"Чат {row['chat_id']}", 90))
+                    archive_title=label(title or f"Чат {row['chat_id']}", 90), source_chat_id=row['chat_id'])
 
     def archive_route(self, key, title):
         with self.connection() as db:
@@ -227,6 +338,8 @@ class Store:
     def save(self, record, media_payload=None):
         record = {**dict.fromkeys(EXTRA_FIELDS + ('raw_message',)), **record}
         with self.connection() as db:
+            if not self.channel_permitted(db, record['chat_id']):
+                return False
             cursor = db.execute(f"INSERT INTO messages ({','.join(CAPTURE_FIELDS)}) VALUES ({','.join(':' + f for f in CAPTURE_FIELDS)}) ON CONFLICT(chat_id,message_id) DO NOTHING", record)
             if cursor.rowcount and media_payload:
                 self.queue_media(db, 'message', record['chat_id'], record['message_id'], media_payload)
@@ -237,6 +350,8 @@ class Store:
         # Preserve known historical values; fill only absent context/content.
         fields = ('user_id', 'username', 'first_name', 'last_name', 'text') + EXTRA_FIELDS + ('raw_message',)
         with self.connection() as db:
+            if not self.channel_permitted(db, record['chat_id']):
+                return
             values = [record.get(f) for f in fields] + [time.time(), record['chat_id'], record['message_id']]
             updates = ','.join(f'{f}=COALESCE(NULLIF({f},\'\'),?)' for f in fields)
             db.execute(f'UPDATE messages SET {updates},metadata_refreshed_at=? WHERE chat_id=? AND message_id=?', values)
@@ -265,11 +380,13 @@ class Store:
                 title = author(self.display_record(db,chat)) if chat and chat['chat_type']=='private' else label(chat['chat_title']) if chat else 'Неизвестный источник'
                 username = ' @' + label(chat['chat_username']) if chat and chat['chat_username'] and chat['chat_type']!='private' else ''
                 text = f"{action} сообщений: {row['count']}\n💬 {title}{username}\nСохранение в архив через очередь."
-                self.enqueue(db, 'digest:' + row['digest_key'], 'notify', text, public_source=bool(row['public_source']))
+                if self.channel_permitted(db, row['chat_id'], notifications=True):
+                    self.enqueue(db, 'digest:' + row['digest_key'], 'notify', text,
+                                 public_source=bool(row['public_source']), source_chat_id=row['chat_id'])
                 db.execute('DELETE FROM deletion_digests WHERE digest_key=?', (row['digest_key'],))
 
     def delete_row(self, db, row, source='update'):
-        if row is None or row['deleted']:
+        if row is None or row['deleted'] or not self.channel_permitted(db, row['chat_id']):
             return False
         chat_id, message_id = row['chat_id'], row['message_id']
         key = f'delete:{chat_id}:{message_id}'
@@ -309,7 +426,7 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM messages WHERE chat_id=? AND message_id=?',
                              (chat_id, message_id)).fetchone()
-            if row is None or row['deleted'] or (row['text'] or '') == text:
+            if row is None or row['deleted'] or (row['text'] or '') == text or not self.channel_permitted(db, chat_id):
                 return False
             revision = row['revision'] + 1
             db.execute('INSERT INTO edits VALUES (?,?,?,?,?,?)',
@@ -341,6 +458,8 @@ class Store:
             self.attach(db, 'story', owner_id, story_id, path)
 
     def attach(self, db, kind, owner_id, item_id, path):
+        if kind=='message' and not self.channel_permitted(db, owner_id):
+            return
         if kind == 'message':
             db.execute('UPDATE messages SET file_path=? WHERE chat_id=? AND message_id=?',
                        (str(path), owner_id, item_id))
@@ -362,6 +481,8 @@ class Store:
 
     @staticmethod
     def queue_media(db, kind, owner_id, item_id, payload):
+        if kind=='message' and not Store.channel_permitted(db, owner_id):
+            return
         if len(payload) > 1024 * 1024:
             # An unusual TL object must not roll back already captured text.
             db.execute("INSERT OR REPLACE INTO health VALUES ('media_error','MetadataTooLarge')")
@@ -374,7 +495,8 @@ class Store:
     def pending_media(self, limit=4):
         with self.connection() as db:
             return [dict(r) for r in db.execute(
-                'SELECT * FROM media_jobs WHERE next_try<=? ORDER BY created_at,job_key LIMIT ?',
+                f'''SELECT * FROM media_jobs WHERE next_try<=? AND
+                (kind!='message' OR {self.channel_clause('media_jobs.owner_id')}) ORDER BY created_at,job_key LIMIT ?''',
                 (time.time(), limit))]
 
     def complete_media(self, key, path):
@@ -382,6 +504,8 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM media_jobs WHERE job_key=?', (key,)).fetchone()
             if row:
+                if row['kind']=='message' and not self.channel_permitted(db, row['owner_id']):
+                    return
                 self.attach(db, row['kind'], row['owner_id'], row['item_id'], path)
                 db.execute('DELETE FROM media_jobs WHERE job_key=?', (key,))
 
@@ -398,12 +522,16 @@ class Store:
     def note_deletion(self, chat_id, message_id):
         key = f'{chat_id}:{message_id}'
         with self.connection() as db:
+            if not self.channel_permitted(db, chat_id):
+                return key
             db.execute('''INSERT OR IGNORE INTO deletion_signals(signal_key,chat_id,message_id,created_at)
                 VALUES (?,?,?,?)''', (key, chat_id, message_id, time.time()))
         return key
 
     def note_deletions(self, chat_id, message_ids):
         with self.connection() as db:
+            if not self.channel_permitted(db, chat_id):
+                return
             created_at = time.time()
             db.executemany('''INSERT OR IGNORE INTO deletion_signals(signal_key,chat_id,message_id,created_at)
                 VALUES (?,?,?,?)''', ((f'{chat_id}:{mid}', chat_id, mid, created_at) for mid in message_ids))
@@ -431,6 +559,8 @@ class Store:
 
     def note_history_gap(self, chat_id, max_id):
         with self.connection() as db:
+            if not self.channel_permitted(db, chat_id):
+                return
             db.execute('''INSERT INTO history_gaps(chat_id,max_id,created_at) VALUES (?,?,?)
                 ON CONFLICT(chat_id) DO UPDATE SET max_id=MAX(max_id,excluded.max_id),created_at=excluded.created_at''', (chat_id, max_id, time.time()))
 
@@ -471,6 +601,7 @@ class Store:
         cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
         with self.connection() as db:
             return [dict(r) for r in db.execute(f'''SELECT {ROW_FIELDS} FROM messages WHERE deleted=0
+                AND {self.channel_clause('messages.chat_id')}
                 AND date_sent>=? AND checked_at<=? ORDER BY checked_at,date_sent LIMIT ?''',
                 (cutoff, time.time() - interval, limit))]
 
